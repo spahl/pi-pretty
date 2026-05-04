@@ -47,7 +47,7 @@ function withStdoutColumns<T>(columns: number, fn: () => T): T {
 	}
 }
 
-function loadBashTool() {
+function loadBashTool(exec: any = async () => ({ content: [{ type: "text", text: "" }] })) {
 	const noopExec = async () => ({ content: [{ type: "text", text: "" }] });
 	const tools = new Map<string, any>();
 	const pi = {
@@ -59,7 +59,7 @@ function loadBashTool() {
 	piPrettyExtension(pi, {
 		sdk: {
 			createReadToolDefinition: mockToolFactory(noopExec),
-			createBashToolDefinition: mockToolFactory(noopExec),
+			createBashToolDefinition: mockToolFactory(exec),
 			createLsToolDefinition: mockToolFactory(noopExec),
 			createFindToolDefinition: mockToolFactory(noopExec),
 			createGrepToolDefinition: mockToolFactory(noopExec),
@@ -163,5 +163,97 @@ describe("bash renderCall expansion", () => {
 				expect(visibleWidth(line)).toBeLessThanOrEqual(20);
 			}
 		});
+	});
+});
+
+describe("bash streaming rendering", () => {
+	it("normalizes partial updates with pi-pretty bash details", async () => {
+		const command = "printf line-1";
+		const partialUpdates: any[] = [];
+		const bashTool = loadBashTool(async (_tid: string, _params: any, _sig: AbortSignal | undefined, onUpdate: any) => {
+			onUpdate?.({
+				content: [{ type: "text", text: "line-1" }],
+				details: { fullOutputPath: "/tmp/full-output.txt" },
+			});
+
+			return { content: [{ type: "text", text: "done" }] };
+		});
+
+		const result = await bashTool.execute("tid", { command }, undefined, (partial: any) => partialUpdates.push(partial), {});
+
+		expect(partialUpdates).toHaveLength(1);
+		expect(partialUpdates[0].details).toMatchObject({
+			_type: "bashResult",
+			text: "line-1",
+			command,
+			exitCode: null,
+			running: true,
+			fullOutputPath: "/tmp/full-output.txt",
+		});
+		expect(result.details).toMatchObject({
+			_type: "bashResult",
+			text: "done",
+			command,
+			exitCode: 0,
+			running: false,
+		});
+	});
+
+	it("renders partial bash results as running instead of killed", () => {
+		const bashTool = loadBashTool();
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: "line-1" }],
+				details: {
+					_type: "bashResult",
+					text: "line-1",
+					exitCode: null,
+					command: "echo line-1",
+					running: true,
+				},
+			},
+			{ expanded: false, isPartial: true },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("running");
+		expect(rendered.getText()).not.toContain("killed");
+	});
+
+	it("renders the latest streamed lines for collapsed partial bash results", () => {
+		const bashTool = loadBashTool();
+		const output = Array.from({ length: 100 }, (_, i) => `line-${i + 1}`).join("\n");
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: {
+					_type: "bashResult",
+					text: output,
+					exitCode: null,
+					command: "seq 1 100",
+					running: true,
+				},
+			},
+			{ expanded: false, isPartial: true },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("line-100");
+		expect(rendered.getText()).toContain("earlier lines");
+		expect(rendered.getText()).not.toContain("more lines");
 	});
 });

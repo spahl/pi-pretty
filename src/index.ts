@@ -638,11 +638,16 @@ async function renderFileContent(
 }
 
 /** Render bash output with colored exit code and stderr highlighting. */
-function renderBashOutput(text: string, exitCode: number | null): { summary: string; body: string } {
-	const isOk = exitCode === 0;
-	const statusFg = isOk ? FG_GREEN : FG_RED;
-	const statusIcon = isOk ? "✓" : "✗";
-	const codeStr = exitCode !== null ? `${statusFg}${statusIcon} exit ${exitCode}${RST}` : `${FG_YELLOW}⚡ killed${RST}`;
+function renderBashOutput(text: string, exitCode: number | null, isPartial = false): { summary: string; body: string } {
+	let codeStr: string;
+	if (isPartial) {
+		codeStr = `${FG_YELLOW}… running${RST}`;
+	} else {
+		const isOk = exitCode === 0;
+		const statusFg = isOk ? FG_GREEN : FG_RED;
+		const statusIcon = isOk ? "✓" : "✗";
+		codeStr = exitCode !== null ? `${statusFg}${statusIcon} exit ${exitCode}${RST}` : `${FG_YELLOW}⚡ killed${RST}`;
+	}
 
 	const lines = text.split("\n");
 	const maxShow = MAX_PREVIEW_LINES;
@@ -859,10 +864,17 @@ type GrepRenderState = { _gk?: string; _gt?: string };
 type MultiGrepRenderState = { _mgk?: string; _mgt?: string };
 type FindResultDetails = { _type: "findResult"; text: string; pattern: string; matchCount: number };
 type GrepResultDetails = { _type: "grepResult"; text: string; pattern: string; matchCount: number };
+type BashResultDetails = {
+	_type: "bashResult";
+	text: string;
+	exitCode: number | null;
+	command: string;
+	running?: boolean;
+} & Record<string, unknown>;
 type RenderDetails =
 	| { _type: "readImage"; filePath: string; data: string; mimeType: string }
 	| { _type: "readFile"; filePath: string; content: string; offset: number; lineCount: number }
-	| { _type: "bashResult"; text: string; exitCode: number | null; command: string }
+	| BashResultDetails
 	| { _type: "lsResult"; text: string; path: string; entryCount: number }
 	| FindResultDetails
 	| GrepResultDetails;
@@ -886,6 +898,25 @@ function getTextContent(result: ToolResultLike): string {
 
 function setResultDetails<T>(result: ToolResultLike, details: T): void {
 	result.details = details;
+}
+
+function makeBashResultDetails(
+	result: ToolResultLike,
+	command: string,
+	exitCode: number | null,
+	running: boolean,
+): BashResultDetails {
+	const existingDetails =
+		result.details && typeof result.details === "object" ? (result.details as Record<string, unknown>) : {};
+
+	return {
+		...existingDetails,
+		_type: "bashResult",
+		text: getTextContent(result),
+		exitCode,
+		command,
+		running,
+	};
 }
 
 function makeTextResult<TDetails>(text: string, details: TDetails): ToolResultLike<TDetails> {
@@ -1237,7 +1268,15 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				upd: AgentToolUpdateCallback<unknown> | undefined,
 				ctx: ExtensionContext,
 			) {
-				const result = (await origBash.execute(tid, params, sig, upd, ctx)) as ToolResultLike;
+				const command = params.command ?? "";
+				const wrappedUpdate: AgentToolUpdateCallback<unknown> | undefined = upd
+					? (partialResult) => {
+							const partial = partialResult as ToolResultLike;
+							setResultDetails(partial, makeBashResultDetails(partial, command, null, true));
+							upd(partialResult);
+						}
+					: undefined;
+				const result = (await origBash.execute(tid, params, sig, wrappedUpdate, ctx)) as ToolResultLike;
 				const textContent = getTextContent(result);
 
 				let exitCode: number | null = 0;
@@ -1249,12 +1288,7 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 					}
 				}
 
-				setResultDetails(result, {
-					_type: "bashResult",
-					text: textContent ?? "",
-					exitCode,
-					command: params.command ?? "",
-				});
+				setResultDetails(result, makeBashResultDetails(result, command, exitCode, false));
 
 				return result;
 			},
@@ -1273,7 +1307,7 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				return text;
 			},
 
-			renderResult(result: ToolResultLike, _opt: unknown, theme: ThemeLike, ctx: RenderContextLike) {
+			renderResult(result: ToolResultLike, opt: ToolRenderResultOptions, theme: ThemeLike, ctx: RenderContextLike) {
 				resolveBaseBackground(theme);
 				const text = ctx.lastComponent ?? new TextComponent("", 0, 0);
 
@@ -1284,7 +1318,8 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 
 				const d = result.details as RenderDetails | undefined;
 				if (d?._type === "bashResult") {
-					const { summary } = renderBashOutput(d.text, d.exitCode);
+					const isPartial = opt.isPartial || d.running === true;
+					const { summary } = renderBashOutput(d.text, d.exitCode, isPartial);
 					const lines = d.text.split("\n");
 					const lineCount = lines.length;
 					const lineInfo = lineCount > 1 ? `  ${FG_DIM}(${lineCount} lines)${RST}` : "";
@@ -1292,15 +1327,21 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 
 					if (d.text.trim()) {
 						const maxShow = ctx.expanded ? lineCount : MAX_PREVIEW_LINES;
-						const show = lines.slice(0, maxShow);
+						const showTail = isPartial && !ctx.expanded;
+						const hiddenBefore = showTail ? Math.max(0, lineCount - maxShow) : 0;
+						const hiddenAfter = showTail ? 0 : Math.max(0, lineCount - maxShow);
+						const show = showTail ? lines.slice(Math.max(0, lineCount - maxShow)) : lines.slice(0, maxShow);
 						const tw = termW();
 						const out: string[] = [header, rule(tw)];
+						if (hiddenBefore > 0) {
+							out.push(`${FG_DIM}  … ${hiddenBefore} earlier lines${RST}`);
+						}
 						for (const line of show) {
 							out.push(`  ${line}`);
 						}
 						out.push(rule(tw));
-						if (lineCount > maxShow) {
-							out.push(`${FG_DIM}  … ${lineCount - maxShow} more lines${RST}`);
+						if (hiddenAfter > 0) {
+							out.push(`${FG_DIM}  … ${hiddenAfter} more lines${RST}`);
 						}
 						text.setText(fillToolBackground(out.join("\n")));
 					} else {
@@ -1310,8 +1351,13 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				}
 
 				const fallback = result.content?.[0];
-				const fallbackText = fallback && isTextContent(fallback) ? fallback.text : "done";
-				text.setText(fillToolBackground(`  ${theme.fg("dim", String(fallbackText).slice(0, 120))}`));
+				const fallbackText = fallback && isTextContent(fallback) ? fallback.text : "";
+				if (opt.isPartial && fallbackText) {
+					text.setText(fillToolBackground(`  ${theme.fg("dim", String(fallbackText))}`));
+					return text;
+				}
+				const finalFallbackText = fallbackText || "done";
+				text.setText(fillToolBackground(`  ${theme.fg("dim", String(finalFallbackText).slice(0, 120))}`));
 				return text;
 			},
 		});
