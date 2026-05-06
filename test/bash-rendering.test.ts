@@ -179,7 +179,13 @@ describe("bash streaming rendering", () => {
 			return { content: [{ type: "text", text: "done" }] };
 		});
 
-		const result = await bashTool.execute("tid", { command }, undefined, (partial: any) => partialUpdates.push(partial), {});
+		const result = await bashTool.execute(
+			"tid",
+			{ command },
+			undefined,
+			(partial: any) => partialUpdates.push(partial),
+			{},
+		);
 
 		expect(partialUpdates).toHaveLength(1);
 		expect(partialUpdates[0].details).toMatchObject({
@@ -227,6 +233,33 @@ describe("bash streaming rendering", () => {
 		expect(rendered.getText()).not.toContain("killed");
 	});
 
+	it("uses opt.isPartial as the canonical running signal", () => {
+		const bashTool = loadBashTool();
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: "line-1" }],
+				details: {
+					_type: "bashResult",
+					text: "line-1",
+					exitCode: null,
+					command: "echo line-1",
+				},
+			},
+			{ expanded: false, isPartial: true },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("running");
+		expect(rendered.getText()).not.toContain("killed");
+	});
+
 	it("renders the latest streamed lines for collapsed partial bash results", () => {
 		const bashTool = loadBashTool();
 		const output = Array.from({ length: 100 }, (_, i) => `line-${i + 1}`).join("\n");
@@ -255,5 +288,221 @@ describe("bash streaming rendering", () => {
 		expect(rendered.getText()).toContain("line-100");
 		expect(rendered.getText()).toContain("earlier lines");
 		expect(rendered.getText()).not.toContain("more lines");
+	});
+
+	it("normalizes Pi's initial empty bash partial update", async () => {
+		const command = "sleep 1";
+		const partialUpdates: any[] = [];
+		const bashTool = loadBashTool(async (_tid: string, _params: any, _sig: AbortSignal | undefined, onUpdate: any) => {
+			onUpdate?.({ content: [], details: undefined });
+
+			return { content: [{ type: "text", text: "" }] };
+		});
+
+		await bashTool.execute("tid", { command }, undefined, (partial: any) => partialUpdates.push(partial), {});
+
+		expect(partialUpdates).toHaveLength(1);
+		expect(partialUpdates[0].details).toMatchObject({
+			_type: "bashResult",
+			text: "",
+			command,
+			exitCode: null,
+			running: true,
+		});
+	});
+
+	it("renders an empty partial bash result as running", () => {
+		const bashTool = loadBashTool();
+		const rendered = bashTool.renderResult(
+			{
+				content: [],
+				details: {
+					_type: "bashResult",
+					text: "",
+					exitCode: null,
+					command: "sleep 1",
+					running: true,
+				},
+			},
+			{ expanded: false, isPartial: true },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("running");
+		expect(rendered.getText()).not.toContain("done");
+		expect(rendered.getText()).not.toContain("killed");
+	});
+
+	it("renders the latest lines for collapsed final bash results", () => {
+		const bashTool = loadBashTool();
+		const output = Array.from({ length: 100 }, (_, i) => `line-${String(i + 1).padStart(3, "0")}`).join("\n");
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: {
+					_type: "bashResult",
+					text: output,
+					exitCode: 0,
+					command: "seq 1 100",
+					running: false,
+				},
+			},
+			{ expanded: false, isPartial: false },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("line-100");
+		expect(rendered.getText()).toContain("earlier lines");
+		expect(rendered.getText()).not.toContain("line-001");
+		expect(rendered.getText()).not.toContain("more lines");
+	});
+
+	it("renders all final bash lines when expanded", () => {
+		const bashTool = loadBashTool();
+		const output = Array.from({ length: 100 }, (_, i) => `line-${String(i + 1).padStart(3, "0")}`).join("\n");
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: {
+					_type: "bashResult",
+					text: output,
+					exitCode: 0,
+					command: "seq 1 100",
+					running: false,
+				},
+			},
+			{ expanded: true, isPartial: false },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: true,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("line-001");
+		expect(rendered.getText()).toContain("line-100");
+		expect(rendered.getText()).not.toContain("earlier lines");
+		expect(rendered.getText()).not.toContain("more lines");
+	});
+
+	it("renders truncation and full output notices for partial bash results", () => {
+		const bashTool = loadBashTool();
+		const output = Array.from({ length: 5 }, (_, i) => `line-${96 + i}`).join("\n");
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: {
+					_type: "bashResult",
+					text: output,
+					exitCode: null,
+					command: "seq 1 100",
+					running: true,
+					fullOutputPath: "/tmp/full-output.txt",
+					truncation: {
+						truncated: true,
+						truncatedBy: "lines",
+						outputLines: 5,
+						totalLines: 100,
+					},
+				},
+			},
+			{ expanded: false, isPartial: true },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("Full output: /tmp/full-output.txt");
+		expect(rendered.getText()).toContain("Truncated: showing 5 of 100 lines");
+	});
+
+	it("renders full output path when provided without truncation", () => {
+		const bashTool = loadBashTool();
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: "line-1" }],
+				details: {
+					_type: "bashResult",
+					text: "line-1",
+					exitCode: 0,
+					command: "printf line-1",
+					running: false,
+					fullOutputPath: "/tmp/full-output.txt",
+				},
+			},
+			{ expanded: false, isPartial: false },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		expect(rendered.getText()).toContain("Full output: /tmp/full-output.txt");
+		expect(rendered.getText()).not.toContain("Truncated:");
+	});
+
+	it("does not duplicate core final bash truncation notices", () => {
+		const bashTool = loadBashTool();
+		const fullOutputPath = "/tmp/full-output.txt";
+		const output = `line-099\nline-100\n\n[Showing lines 99-100 of 100. Full output: ${fullOutputPath}]`;
+		const rendered = bashTool.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: {
+					_type: "bashResult",
+					text: output,
+					exitCode: 0,
+					command: "seq 1 100",
+					running: false,
+					fullOutputPath,
+					truncation: {
+						truncated: true,
+						truncatedBy: "lines",
+						outputLines: 2,
+						totalLines: 100,
+					},
+				},
+			},
+			{ expanded: false, isPartial: false },
+			mockTheme,
+			{
+				lastComponent: new MockText(),
+				isError: false,
+				state: {},
+				expanded: false,
+				invalidate: () => {},
+			},
+		);
+
+		const occurrences = rendered.getText().split(`Full output: ${fullOutputPath}`).length - 1;
+		expect(occurrences).toBe(1);
+		expect(rendered.getText()).not.toContain("[Showing lines");
+		expect(rendered.getText()).toContain("Truncated: showing 2 of 100 lines");
 	});
 });

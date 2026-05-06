@@ -638,9 +638,9 @@ async function renderFileContent(
 }
 
 /** Render bash output with colored exit code and stderr highlighting. */
-function renderBashOutput(text: string, exitCode: number | null, isPartial = false): { summary: string; body: string } {
+function renderBashOutput(text: string, exitCode: number | null, isRunning = false): { summary: string; body: string } {
 	let codeStr: string;
-	if (isPartial) {
+	if (isRunning) {
 		codeStr = `${FG_YELLOW}… running${RST}`;
 	} else {
 		const isOk = exitCode === 0;
@@ -872,12 +872,25 @@ type GrepResultDetails = {
 	literal?: boolean;
 	regexFallbackError?: string;
 };
+type BashTruncationDetails = {
+	truncated?: boolean;
+	truncatedBy?: "lines" | "bytes" | string | null;
+	outputLines?: number;
+	totalLines?: number;
+	outputBytes?: number;
+	totalBytes?: number;
+	maxLines?: number;
+	maxBytes?: number;
+	lastLinePartial?: boolean;
+};
 type BashResultDetails = {
 	_type: "bashResult";
 	text: string;
 	exitCode: number | null;
 	command: string;
 	running?: boolean;
+	truncation?: BashTruncationDetails;
+	fullOutputPath?: string;
 } & Record<string, unknown>;
 type RenderDetails =
 	| { _type: "readImage"; filePath: string; data: string; mimeType: string }
@@ -925,6 +938,53 @@ function makeBashResultDetails(
 		command,
 		running,
 	};
+}
+
+function getBashFullOutputPath(details: BashResultDetails): string | undefined {
+	return typeof details.fullOutputPath === "string" && details.fullOutputPath.trim()
+		? details.fullOutputPath
+		: undefined;
+}
+
+function getBashTruncation(details: BashResultDetails): BashTruncationDetails | undefined {
+	const truncation = details.truncation;
+	return truncation && typeof truncation === "object" ? truncation : undefined;
+}
+
+function buildBashOutputNotices(details: BashResultDetails): string[] {
+	const notices: string[] = [];
+	const fullOutputPath = getBashFullOutputPath(details);
+	const truncation = getBashTruncation(details);
+
+	if (fullOutputPath) {
+		notices.push(`Full output: ${fullOutputPath}`);
+	}
+
+	if (truncation?.truncated) {
+		if (
+			truncation.truncatedBy === "lines" &&
+			typeof truncation.outputLines === "number" &&
+			typeof truncation.totalLines === "number"
+		) {
+			notices.push(`Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`);
+		} else if (typeof truncation.outputBytes === "number" && typeof truncation.totalBytes === "number") {
+			notices.push(`Truncated: showing ${truncation.outputBytes} of ${truncation.totalBytes} bytes`);
+		} else {
+			notices.push("Truncated output");
+		}
+	}
+
+	return notices;
+}
+
+function stripCoreBashTruncationNotice(text: string, fullOutputPath?: string): string {
+	if (!fullOutputPath) return text;
+
+	const noticeStart = text.lastIndexOf("\n\n[Showing ");
+	if (noticeStart === -1) return text;
+
+	const suffix = text.slice(noticeStart);
+	return suffix.includes(`Full output: ${fullOutputPath}]`) ? text.slice(0, noticeStart) : text;
 }
 
 function makeTextResult<TDetails>(text: string, details: TDetails): ToolResultLike<TDetails> {
@@ -1355,16 +1415,20 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 
 				const d = result.details as RenderDetails | undefined;
 				if (d?._type === "bashResult") {
-					const isPartial = opt.isPartial || d.running === true;
-					const { summary } = renderBashOutput(d.text, d.exitCode, isPartial);
-					const lines = d.text.split("\n");
+					// Pi passes opt.isPartial for live tool updates; d.running is kept as a compatibility fallback.
+					const isRunning = opt.isPartial || d.running === true;
+					const fullOutputPath = getBashFullOutputPath(d);
+					const displayText = stripCoreBashTruncationNotice(d.text, fullOutputPath);
+					const notices = buildBashOutputNotices(d);
+					const { summary } = renderBashOutput(displayText, d.exitCode, isRunning);
+					const lines = displayText.split("\n");
 					const lineCount = lines.length;
 					const lineInfo = lineCount > 1 ? `  ${FG_DIM}(${lineCount} lines)${RST}` : "";
 					const header = `  ${summary}${lineInfo}`;
 
-					if (d.text.trim()) {
+					if (displayText.trim()) {
 						const maxShow = ctx.expanded ? lineCount : MAX_PREVIEW_LINES;
-						const showTail = isPartial && !ctx.expanded;
+						const showTail = !ctx.expanded;
 						const hiddenBefore = showTail ? Math.max(0, lineCount - maxShow) : 0;
 						const hiddenAfter = showTail ? 0 : Math.max(0, lineCount - maxShow);
 						const show = showTail ? lines.slice(Math.max(0, lineCount - maxShow)) : lines.slice(0, maxShow);
@@ -1380,9 +1444,16 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 						if (hiddenAfter > 0) {
 							out.push(`${FG_DIM}  … ${hiddenAfter} more lines${RST}`);
 						}
+						for (const notice of notices) {
+							out.push(`${FG_DIM}  ${notice}${RST}`);
+						}
 						text.setText(fillToolBackground(out.join("\n")));
 					} else {
-						text.setText(fillToolBackground(header));
+						const out = [header];
+						for (const notice of notices) {
+							out.push(`${FG_DIM}  ${notice}${RST}`);
+						}
+						text.setText(fillToolBackground(out.join("\n")));
 					}
 					return text;
 				}
