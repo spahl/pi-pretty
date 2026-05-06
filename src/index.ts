@@ -733,7 +733,7 @@ function renderFindResults(text: string): string {
 }
 
 /** Render grep results with highlighted matches and line numbers. */
-async function renderGrepResults(text: string, pattern: string): Promise<string> {
+async function renderGrepResults(text: string, pattern: string, literal = false): Promise<string> {
 	const lines = normalizeLineEndings(text).split("\n");
 	if (!lines.length || (lines.length === 1 && !lines[0].trim())) return `${FG_DIM}(no matches)${RST}`;
 
@@ -741,10 +741,11 @@ async function renderGrepResults(text: string, pattern: string): Promise<string>
 	let currentFile = "";
 	let count = 0;
 
-	// Try to build a regex for highlighting
+	// Try to build a regex for highlighting. Literal fallback searches often
+	// contain regex metacharacters like `{` or `(`, so escape them here too.
 	let re: RegExp | null = null;
 	try {
-		re = new RegExp(`(${pattern})`, "gi");
+		if (pattern) re = new RegExp(literal ? escapeRegexLiteral(pattern) : pattern, "gi");
 	} catch {
 		// invalid regex — skip highlighting
 	}
@@ -769,7 +770,7 @@ async function renderGrepResults(text: string, pattern: string): Promise<string>
 			const nw = Math.max(3, lineNo.length);
 			let display = content;
 			if (re) {
-				display = content.replace(re, `${RST}${FG_YELLOW}${BOLD}$1${RST}`);
+				display = content.replace(re, (match) => `${RST}${FG_YELLOW}${BOLD}${match}${RST}`);
 			}
 			out.push(`  ${lnum(Number(lineNo), nw)} ${FG_RULE}│${RST} ${display}${RST}`);
 			count++;
@@ -863,7 +864,14 @@ type MultiGrepParams = {
 type GrepRenderState = { _gk?: string; _gt?: string };
 type MultiGrepRenderState = { _mgk?: string; _mgt?: string };
 type FindResultDetails = { _type: "findResult"; text: string; pattern: string; matchCount: number };
-type GrepResultDetails = { _type: "grepResult"; text: string; pattern: string; matchCount: number };
+type GrepResultDetails = {
+	_type: "grepResult";
+	text: string;
+	pattern: string;
+	matchCount: number;
+	literal?: boolean;
+	regexFallbackError?: string;
+};
 type BashResultDetails = {
 	_type: "bashResult";
 	text: string;
@@ -944,6 +952,35 @@ function getErrorMessage(error: unknown): string {
 function trimToUndefined(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	return trimmed ? trimmed : undefined;
+}
+
+function compactNoticeText(text: string, maxLength = 240): string {
+	const compact = normalizeLineEndings(text)
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.join(" ");
+	return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact;
+}
+
+function isRegexParseError(error: unknown): boolean {
+	const message = getErrorMessage(error).toLowerCase();
+	return (
+		message.includes("regex parse error") ||
+		message.includes("error parsing regex") ||
+		message.includes("error parsing regexp") ||
+		message.includes("repetition quantifier expects") ||
+		(message.includes("regex") && message.includes("parse"))
+	);
+}
+
+function appendTextResultNotice(result: ToolResultLike, notice: string): void {
+	const textContent = result.content?.find(isTextContent);
+	if (textContent) {
+		textContent.text = appendNotices(normalizeLineEndings(textContent.text || ""), [notice]);
+		return;
+	}
+	result.content = [{ type: "text", text: `[${notice}]` }];
 }
 
 function escapeRegexLiteral(text: string): string {
@@ -1542,6 +1579,11 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 		pi.registerTool({
 			...origGrep,
 			name: "grep",
+			description: `${origGrep.description ?? "Search file contents for a pattern."} Prefer literal=true when searching for exact code/text (identifiers, function calls, braces, parens, dots). If regex parsing fails, pi-pretty automatically retries as a literal search and reports that fallback.`,
+			promptGuidelines: [
+				"For grep, set literal=true when searching exact identifiers, code snippets, function calls, or text containing regex metacharacters such as { } ( ) [ ] . * + ? | \\.",
+				"Use grep as regex only when you intentionally need regex syntax; use multi_grep instead of regex alternation for OR searches.",
+			],
 
 			async execute(
 				tid: string,
@@ -1584,6 +1626,8 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 								text: textContent,
 								pattern: params.pattern,
 								matchCount: Math.min(grep.items.length, effectiveLimit),
+								literal: params.literal === true || Boolean(grep.regexFallbackError) || undefined,
+								regexFallbackError: grep.regexFallbackError ? compactNoticeText(grep.regexFallbackError) : undefined,
 							});
 						}
 					} catch {
@@ -1592,7 +1636,21 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				}
 
 				// SDK fallback
-				const result = await origGrep.execute(tid, params, sig, upd as never, ctx);
+				let result: ToolResultLike;
+				let usedLiteral = params.literal === true;
+				let regexFallbackError: string | undefined;
+				try {
+					result = await origGrep.execute(tid, params, sig, upd as never, ctx);
+				} catch (error: unknown) {
+					if (params.literal !== true && isRegexParseError(error)) {
+						regexFallbackError = compactNoticeText(getErrorMessage(error));
+						result = await origGrep.execute(tid, { ...params, literal: true }, sig, upd as never, ctx);
+						usedLiteral = true;
+						appendTextResultNotice(result, `Regex failed: ${regexFallbackError}, retried as literal match`);
+					} else {
+						throw error;
+					}
+				}
 				const textContent = normalizeLineEndings(getTextContent(result));
 				if (result.content) {
 					for (const content of result.content) {
@@ -1606,6 +1664,8 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 					text: textContent,
 					pattern: params.pattern,
 					matchCount,
+					literal: usedLiteral || undefined,
+					regexFallbackError,
 				});
 
 				return result;
@@ -1641,13 +1701,13 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 
 				const d = result.details;
 				if (d?._type === "grepResult" && d.text) {
-					const key = `grep:${d.pattern}:${d.matchCount}:${termW()}`;
+					const key = `grep:${d.pattern}:${d.matchCount}:${d.literal ? "literal" : "regex"}:${termW()}`;
 					if (ctx.state._gk !== key) {
 						ctx.state._gk = key;
 						const info = `${FG_DIM}${d.matchCount} matches${RST}`;
 						ctx.state._gt = fillToolBackground(`  ${info}`);
 
-						renderGrepResults(d.text, d.pattern)
+						renderGrepResults(d.text, d.pattern, d.literal)
 							.then((rendered: string) => {
 								if (ctx.state._gk !== key) return;
 								ctx.state._gt = fillToolBackground(`  ${info}\n${rendered}`);

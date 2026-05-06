@@ -423,6 +423,38 @@ describe("piPrettyExtension integration", () => {
 			expect(r.details.text).toBe("a.ts:1:TODO\na.ts:5:TODO\nb.ts:10:TODO");
 			expect(r.details.matchCount).toBe(3);
 		});
+
+		it("retries SDK grep as literal when ripgrep rejects malformed regex", async () => {
+			grepExec
+				.mockRejectedValueOnce(new Error("rg: regex parse error:\n(?:CloudchamberdConfig{)\n^\nerror: repetition quantifier expects a valid decimal"))
+				.mockResolvedValueOnce({ content: [{ type: "text", text: "config_test.go:12:CloudchamberdConfig{" }] });
+			load(false);
+			const r = await tools.get("grep")!.execute("t1", { pattern: "CloudchamberdConfig{", glob: "*_test.go" }, null, null, {});
+
+			expect(grepExec).toHaveBeenCalledTimes(2);
+			expect(grepExec).toHaveBeenNthCalledWith(
+				2,
+				"t1",
+				expect.objectContaining({ pattern: "CloudchamberdConfig{", literal: true }),
+				null,
+				null,
+				{},
+			);
+			expect(r.content[0].text).toContain("config_test.go:12:CloudchamberdConfig{");
+			expect(r.content[0].text).toContain("retried as literal match");
+			expect(r.details.literal).toBe(true);
+			expect(r.details.regexFallbackError).toContain("regex parse error");
+		});
+
+		it("does not retry SDK grep as literal for non-regex errors", async () => {
+			grepExec.mockRejectedValueOnce(new Error("Path not found: /tmp/missing"));
+			load(false);
+
+			await expect(tools.get("grep")!.execute("t1", { pattern: "TODO" }, null, null, {})).rejects.toThrow(
+				"Path not found",
+			);
+			expect(grepExec).toHaveBeenCalledOnce();
+		});
 	});
 
 	// ---- read -----------------------------------------------------------
