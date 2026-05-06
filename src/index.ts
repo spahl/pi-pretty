@@ -24,8 +24,8 @@
  */
 
 import * as childProcess from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
-import { basename, dirname, extname, join, relative } from "node:path";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
 
 import type { FileFinder, FileItem, GrepResult, SearchResult } from "@ff-labs/fff-node";
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -1014,6 +1014,77 @@ function trimToUndefined(value: string | undefined): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
+function normalizeToolPathForFs(pathValue: string): string {
+	const trimmed = pathValue.trim();
+	return trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+}
+
+function toolPathExists(baseCwd: string, pathValue: string): boolean {
+	const normalized = normalizeToolPathForFs(pathValue);
+	if (!normalized || normalized.includes("\0")) return false;
+	const absolutePath = isAbsolute(normalized) ? normalized : join(baseCwd, normalized);
+	return existsSync(absolutePath);
+}
+
+function tokenizeWhitespacePathList(value: string): string[] | undefined {
+	const tokens: string[] = [];
+	let current = "";
+	let quote: '"' | "'" | null = null;
+	let escaping = false;
+
+	for (let i = 0; i < value.length; i++) {
+		const char = value[i];
+
+		if (escaping) {
+			current += char;
+			escaping = false;
+			continue;
+		}
+
+		if (char === "\\" && quote !== "'") {
+			escaping = true;
+			continue;
+		}
+
+		if (quote) {
+			if (char === quote) quote = null;
+			else current += char;
+			continue;
+		}
+
+		if (char === '"' || char === "'") {
+			quote = char;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			if (current) {
+				tokens.push(current);
+				current = "";
+			}
+			continue;
+		}
+
+		current += char;
+	}
+
+	if (escaping) current += "\\";
+	if (quote) return undefined;
+	if (current) tokens.push(current);
+	return tokens;
+}
+
+function splitExistingWhitespacePathList(baseCwd: string, pathValue: string | undefined): string[] | undefined {
+	const trimmed = trimToUndefined(pathValue);
+	if (!trimmed || !/\s/.test(trimmed)) return undefined;
+	if (toolPathExists(baseCwd, trimmed)) return undefined;
+
+	const tokens = tokenizeWhitespacePathList(trimmed);
+	if (!tokens || tokens.length < 2) return undefined;
+
+	return tokens.every((token) => toolPathExists(baseCwd, token)) ? tokens : undefined;
+}
+
 function compactNoticeText(text: string, maxLength = 240): string {
 	const compact = normalizeLineEndings(text)
 		.split("\n")
@@ -1707,39 +1778,95 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				}
 
 				// SDK fallback
-				let result: ToolResultLike;
-				let usedLiteral = params.literal === true;
-				let regexFallbackError: string | undefined;
-				try {
-					result = await origGrep.execute(tid, params, sig, upd as never, ctx);
-				} catch (error: unknown) {
-					if (params.literal !== true && isRegexParseError(error)) {
-						regexFallbackError = compactNoticeText(getErrorMessage(error));
-						result = await origGrep.execute(tid, { ...params, literal: true }, sig, upd as never, ctx);
-						usedLiteral = true;
-						appendTextResultNotice(result, `Regex failed: ${regexFallbackError}, retried as literal match`);
-					} else {
-						throw error;
+				const executeSdkGrep = async (
+					grepParams: GrepParams,
+					options: { appendRegexNotice?: boolean } = {},
+				): Promise<{
+					result: ToolResultLike;
+					textContent: string;
+					matchCount: number;
+					usedLiteral: boolean;
+					regexFallbackError?: string;
+				}> => {
+					let result: ToolResultLike;
+					let usedLiteral = grepParams.literal === true;
+					let regexFallbackError: string | undefined;
+					try {
+						result = await origGrep.execute(tid, grepParams, sig, upd as never, ctx);
+					} catch (error: unknown) {
+						if (grepParams.literal !== true && isRegexParseError(error)) {
+							regexFallbackError = compactNoticeText(getErrorMessage(error));
+							result = await origGrep.execute(tid, { ...grepParams, literal: true }, sig, upd as never, ctx);
+							usedLiteral = true;
+							if (options.appendRegexNotice !== false) {
+								appendTextResultNotice(result, `Regex failed: ${regexFallbackError}, retried as literal match`);
+							}
+						} else {
+							throw error;
+						}
 					}
-				}
-				const textContent = normalizeLineEndings(getTextContent(result));
-				if (result.content) {
-					for (const content of result.content) {
-						if (isTextContent(content)) content.text = normalizeLineEndings(content.text || "");
-					}
-				}
-				const matchCount = textContent ? countRipgrepMatches(textContent) : 0;
 
-				setResultDetails<GrepResultDetails>(result, {
+					const textContent = normalizeLineEndings(getTextContent(result));
+					if (result.content) {
+						for (const content of result.content) {
+							if (isTextContent(content)) content.text = normalizeLineEndings(content.text || "");
+						}
+					}
+
+					return {
+						result,
+						textContent,
+						matchCount: textContent ? countRipgrepMatches(textContent) : 0,
+						usedLiteral,
+						regexFallbackError,
+					};
+				};
+
+				const pathList = splitExistingWhitespacePathList(cwd, params.path);
+				if (pathList) {
+					const requestedLimit = Math.max(1, params.limit ?? 100);
+					let remainingLimit = requestedLimit;
+					let matchCount = 0;
+					let usedLiteral = params.literal === true;
+					let regexFallbackError: string | undefined;
+					const parts: string[] = [];
+
+					for (const path of pathList) {
+						if (remainingLimit <= 0) break;
+						const next = await executeSdkGrep({ ...params, path, limit: remainingLimit }, { appendRegexNotice: false });
+						if (next.textContent.trim() && next.matchCount > 0) parts.push(next.textContent);
+						matchCount += next.matchCount;
+						remainingLimit = Math.max(0, requestedLimit - matchCount);
+						usedLiteral = usedLiteral || next.usedLiteral;
+						regexFallbackError ??= next.regexFallbackError;
+					}
+
+					const notices: string[] = [];
+					if (regexFallbackError) notices.push(`Regex failed: ${regexFallbackError}, retried as literal match`);
+					if (matchCount >= requestedLimit && pathList.length > 1) notices.push(`${requestedLimit} limit reached`);
+
+					const textContent = appendNotices(parts.length ? parts.join("\n") : "No matches found", notices);
+					return makeTextResult<GrepResultDetails>(textContent, {
+						_type: "grepResult",
+						text: textContent,
+						pattern: params.pattern,
+						matchCount,
+						literal: usedLiteral || undefined,
+						regexFallbackError,
+					});
+				}
+
+				const sdkResult = await executeSdkGrep(params);
+				setResultDetails<GrepResultDetails>(sdkResult.result, {
 					_type: "grepResult",
-					text: textContent,
+					text: sdkResult.textContent,
 					pattern: params.pattern,
-					matchCount,
-					literal: usedLiteral || undefined,
-					regexFallbackError,
+					matchCount: sdkResult.matchCount,
+					literal: sdkResult.usedLiteral || undefined,
+					regexFallbackError: sdkResult.regexFallbackError,
 				});
 
-				return result;
+				return sdkResult.result;
 			},
 
 			renderCall(args: GrepParams, theme: ThemeLike, ctx: RenderContextLike) {

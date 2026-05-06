@@ -424,6 +424,58 @@ describe("piPrettyExtension integration", () => {
 			expect(r.details.matchCount).toBe(3);
 		});
 
+		it("splits whitespace-separated existing paths before delegating to SDK grep", async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-pretty-grep-"));
+			try {
+				mkdirSync(join(root, "rust"), { recursive: true });
+				mkdirSync(join(root, "go", "pkg", "firechamber"), { recursive: true });
+				mkdirSync(join(root, "docs"), { recursive: true });
+
+				const paths = [
+					join(root, "rust", "init"),
+					join(root, "go", "pkg", "firechamber", "vsock"),
+					join(root, "docs", "cloudchamber-microvm-os.md"),
+					join(root, "docs", "ports-and-protocols.md"),
+				];
+				for (const path of paths) writeFileSync(path, "2324\n");
+
+				grepExec.mockImplementation(async (_tid, grepParams) => ({
+					content: [{ type: "text", text: `${grepParams.path}:1:2324` }],
+				}));
+
+				load(false);
+				const r = await tools.get("grep")!.execute("t1", { pattern: "2324", path: paths.join(" ") }, null, null, {});
+
+				expect(grepExec).toHaveBeenCalledTimes(paths.length);
+				expect(grepExec.mock.calls.map(([, grepParams]) => grepParams.path)).toEqual(paths);
+				expect(r.content[0].text).toBe(paths.map((path) => `${path}:1:2324`).join("\n"));
+				expect(r.details.matchCount).toBe(paths.length);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("does not split an existing path that contains spaces", async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-pretty-grep-"));
+			try {
+				mkdirSync(join(root, "docs with spaces"), { recursive: true });
+				const path = join(root, "docs with spaces", "ports.md");
+				writeFileSync(path, "2324\n");
+
+				grepExec.mockImplementation(async (_tid, grepParams) => ({
+					content: [{ type: "text", text: `${grepParams.path}:1:2324` }],
+				}));
+
+				load(false);
+				await tools.get("grep")!.execute("t1", { pattern: "2324", path }, null, null, {});
+
+				expect(grepExec).toHaveBeenCalledOnce();
+				expect(grepExec.mock.calls[0][1].path).toBe(path);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
 		it("retries SDK grep as literal when ripgrep rejects malformed regex", async () => {
 			grepExec
 				.mockRejectedValueOnce(new Error("rg: regex parse error:\n(?:CloudchamberdConfig{)\n^\nerror: repetition quantifier expects a valid decimal"))
