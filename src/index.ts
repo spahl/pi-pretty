@@ -27,7 +27,7 @@ import * as childProcess from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
 
-import type { FileFinder, FileItem, GrepResult, SearchResult } from "@ff-labs/fff-node";
+import type { FileFinder, GrepResult } from "@ff-labs/fff-node";
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type {
 	AgentToolResult,
@@ -1626,36 +1626,9 @@ export default function piPrettyExtension(pi: PiPrettyApi, deps?: PiPrettyDeps):
 				upd: unknown,
 				ctx: ExtensionContext,
 			) {
-				// Try FFF first (frecency-ranked, SIMD-accelerated)
-				if (_fffFinder && !_fffFinder.isDestroyed) {
-					try {
-						const effectiveLimit = Math.max(1, params.limit ?? 200);
-						let query = params.pattern;
-						if (params.path) query = `${params.path} ${query}`;
-
-						const searchResult = _fffFinder.fileSearch(query, { pageSize: effectiveLimit });
-						if (searchResult.ok) {
-							const search: SearchResult = searchResult.value;
-							const items: FileItem[] = search.items.slice(0, effectiveLimit);
-							const notices: string[] = [];
-							if (_fffPartialIndex) notices.push("Warning: partial file index");
-							if (items.length >= effectiveLimit) notices.push(`${effectiveLimit} limit reached`);
-							if (search.totalMatched > items.length) notices.push(`${search.totalMatched} total matches`);
-
-							const textContent = appendNotices(items.map((item) => item.relativePath).join("\n"), notices);
-							return makeTextResult<FindResultDetails>(textContent, {
-								_type: "findResult",
-								text: textContent,
-								pattern: params.pattern,
-								matchCount: items.length,
-							});
-						}
-					} catch {
-						/* fall through to SDK */
-					}
-				}
-
-				// SDK fallback
+				// FFF fileSearch is a fuzzy finder, while PI find promises glob semantics and
+				// supports an explicit search root. Delegate to the SDK implementation so
+				// patterns such as **/*.ts and path-scoped searches remain exact.
 				const result = await origFind.execute(tid, params, sig, upd as never, ctx);
 				const textContent = getTextContent(result);
 				const matchCount = textContent ? textContent.trim().split("\n").filter(Boolean).length : 0;

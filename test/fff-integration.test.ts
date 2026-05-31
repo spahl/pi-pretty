@@ -524,62 +524,18 @@ describe("piPrettyExtension integration", () => {
 		});
 	});
 
-	// ---- find: FFF path ------------------------------------------------
+	// ---- find: FFF loaded ----------------------------------------------
 
-	describe("find — FFF path", () => {
-		it("uses FFF fileSearch when initialized", async () => {
-			await loadWithFFF();
-			const r = await tools.get("find")!.execute("t1", { pattern: "*.ts" }, null, null, {});
-			expect(findExec).not.toHaveBeenCalled();
-			expect(r.details._type).toBe("findResult");
-			expect(r.content[0].text).toContain("src/index.ts");
-		});
-
-		it("falls back to SDK on FFF { ok: false }", async () => {
-			await loadWithFFF({
-				fileSearch: vi.fn().mockReturnValue({ ok: false, error: "fail" }),
-			});
-			await tools.get("find")!.execute("t1", { pattern: "*.ts" }, null, null, {});
-			expect(findExec).toHaveBeenCalledOnce();
-		});
-
-		it("falls back to SDK on FFF throw", async () => {
-			await loadWithFFF({
-				fileSearch: vi.fn().mockImplementation(() => { throw new Error("crash"); }),
-			});
-			await tools.get("find")!.execute("t1", { pattern: "*.ts" }, null, null, {});
-			expect(findExec).toHaveBeenCalledOnce();
-		});
-
-		it("respects limit param", async () => {
-			const fileSearch = vi.fn().mockReturnValue({
-				ok: true,
-				value: { items: Array.from({ length: 50 }, (_, i) => ({ relativePath: `f${i}.ts` })), totalMatched: 50 },
-			});
-			await loadWithFFF({ fileSearch });
-			await tools.get("find")!.execute("t1", { pattern: "*.ts", limit: 5 }, null, null, {});
-			expect(fileSearch).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ pageSize: 5 }));
-		});
-
-		it("includes path in search query", async () => {
+	describe("find — FFF loaded", () => {
+		it("delegates glob matching to SDK when FFF is initialized", async () => {
 			const fileSearch = vi.fn().mockReturnValue({ ok: true, value: { items: [], totalMatched: 0 } });
 			await loadWithFFF({ fileSearch });
-			await tools.get("find")!.execute("t1", { pattern: "*.ts", path: "src/" }, null, null, {});
-			expect(fileSearch).toHaveBeenCalledWith("src/ *.ts", expect.any(Object));
-		});
-
-		it("shows partial-index + limit notices", async () => {
-			await loadWithFFF({
-				waitForScan: vi.fn().mockResolvedValue({ ok: true, value: false }),
-				fileSearch: vi.fn().mockReturnValue({
-					ok: true,
-					value: { items: Array.from({ length: 200 }, (_, i) => ({ relativePath: `f${i}` })), totalMatched: 500 },
-				}),
-			});
-			const text = (await tools.get("find")!.execute("t1", { pattern: "*" }, null, null, {})).content[0].text;
-			expect(text).toContain("partial file index");
-			expect(text).toContain("200 limit reached");
-			expect(text).toContain("500 total matches");
+			const params = { pattern: "**/*.ts", path: "src", limit: 5 };
+			const r = await tools.get("find")!.execute("t1", params, null, null, {});
+			expect(fileSearch).not.toHaveBeenCalled();
+			expect(findExec).toHaveBeenCalledWith("t1", params, null, null, {});
+			expect(r.details._type).toBe("findResult");
+			expect(r.content[0].text).toContain("src/index.ts");
 		});
 	});
 
